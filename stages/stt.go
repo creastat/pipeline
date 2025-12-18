@@ -53,9 +53,9 @@ func (s *STTStage) Process(ctx context.Context, input <-chan core.Event, output 
 	logger.Info("Starting STT stage", telemetry.String("provider", s.config.Provider.Name()), telemetry.String("language", s.config.Language))
 	logger.Info("Emitting transcribing status")
 
-	// Emit transcribing status
+	// Emit listening status
 	output <- core.StatusEvent{
-		Status:  core.StatusTranscribing,
+		Status:  core.StatusListening,
 		Target:  core.StatusTargetUser,
 		Message: "Listening...",
 	}

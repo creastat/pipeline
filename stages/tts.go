@@ -38,13 +38,6 @@ func (s *TTSStage) Name() string {
 	return "tts"
 }
 
-// logError logs TTS errors without sending them to the user
-func (s *TTSStage) logError(err error) {
-	// Errors are logged at the service level, not sent to client
-	// This prevents TTS-specific errors from disrupting the user experience
-	_ = err // Placeholder for logging integration
-}
-
 // InputTypes returns the event types this stage accepts
 func (s *TTSStage) InputTypes() []core.EventType {
 	return []core.EventType{core.EventTypeLLM}
@@ -60,15 +53,6 @@ func (s *TTSStage) OutputTypes() []core.EventType {
 // This stage receives pre-processed, sentence-complete text and focuses solely on TTS synthesis.
 func (s *TTSStage) Process(ctx context.Context, input <-chan core.Event, output chan<- core.Event) error {
 	logger := s.config.Logger.WithModule(s.Name())
-
-	logger.Info("Emitting speaking status")
-
-	// Emit speaking status
-	output <- core.StatusEvent{
-		Status:  core.StatusSpeaking,
-		Target:  core.StatusTargetBot,
-		Message: "Speaking...",
-	}
 
 	// Channels for coordination
 	textChan := make(chan string, 100)
@@ -92,11 +76,18 @@ func (s *TTSStage) Process(ctx context.Context, input <-chan core.Event, output 
 			})
 			if streamErr != nil {
 				logger.Error("Failed to start TTS stream", telemetry.Err(streamErr), telemetry.String("provider", s.config.Provider.Name()), telemetry.String("language", s.config.Language))
-				output <- core.ErrorEvent{
-					Error:     fmt.Errorf("failed to start TTS stream (provider=%s, language=%s): %w", s.config.Provider.Name(), s.config.Language, streamErr),
-					Retryable: true,
+
+				// Emit user-friendly service message instead of raw error
+				output <- core.ServiceMessageEvent{
+					MessageType: core.ServiceMessageWarning,
+					Content:     "I'm having trouble with my voice right now, but I can still chat via text.",
+					Localized: map[string]string{
+						"en": "I'm having trouble with my voice right now, but I can still chat via text.",
+						"ru": "У меня возникли проблемы с голосом, но я всё ещё могу общаться текстом.",
+					},
 				}
-				// Signal ready even on error so waiters can unblock and see the error
+
+				// Signal ready even on error so waiters can unblock and see the failure
 				close(streamReady)
 				return
 			}
@@ -181,15 +172,13 @@ func (s *TTSStage) Process(ctx context.Context, input <-chan core.Event, output 
 					return
 				}
 
-				// Log other errors but check if we received any chunks
-				// Some providers might return an error at the end of a successful stream
+				// Log error and notify client via errChan
 				if audioChunkCount > 0 {
-					logger.Warn("Error receiving TTS chunk after successful stream", telemetry.Err(err), telemetry.Int("chunks_received", audioChunkCount))
-					// Don't emit DoneEvent here - let the main loop handle it
-					return
+					logger.Warn("Error receiving TTS chunk after partial stream", telemetry.Err(err), telemetry.Int("chunks_received", audioChunkCount))
+				} else {
+					logger.Error("Error receiving TTS chunk", telemetry.Err(err))
 				}
 
-				logger.Error("Error receiving TTS chunk", telemetry.Err(err), telemetry.Int("chunks_received", audioChunkCount))
 				select {
 				case errChan <- fmt.Errorf("error receiving TTS chunk: %w", err):
 				default:
@@ -227,13 +216,9 @@ func (s *TTSStage) Process(ctx context.Context, input <-chan core.Event, output 
 		defer wg.Done()
 		defer close(textChan)
 
-		for event := range input {
-			if statusEvent, ok := event.(core.StatusEvent); ok {
-				logger.Debug("Forwarding status event", telemetry.String("status", string(statusEvent.Status)))
-				output <- statusEvent
-				continue
-			}
+		hasSentStatus := false
 
+		for event := range input {
 			if llmEvent, ok := event.(core.LLMEvent); ok {
 				if strings.TrimSpace(llmEvent.Delta) == "" {
 					continue
@@ -242,6 +227,16 @@ func (s *TTSStage) Process(ctx context.Context, input <-chan core.Event, output 
 				// Initialize stream on first text chunk
 				if !initStream() {
 					return
+				}
+
+				// Emit speaking status only once when we actually start processing text
+				if !hasSentStatus {
+					output <- core.StatusEvent{
+						Status:  core.StatusSpeaking,
+						Target:  core.StatusTargetBot,
+						Message: "Generating voice...",
+					}
+					hasSentStatus = true
 				}
 
 				logger.Trace("Received text for TTS", telemetry.String("text", llmEvent.Delta))
@@ -256,18 +251,10 @@ func (s *TTSStage) Process(ctx context.Context, input <-chan core.Event, output 
 			// If we receive a DoneEvent, signal end of text and stop processing
 			if _, ok := event.(core.DoneEvent); ok {
 				logger.Info("Received DoneEvent, signaling end of text to TTS provider")
-
-				// Wait for text-sending goroutine to finish
-				// This ensures all text is sent before we call Finish()
-				logger.Trace("Waiting for text-sending goroutine to complete")
-
-				// Don't call Finish() here - do it after wg.Wait() in main loop
-				// to avoid concurrent writes to WebSocket
-
-				// Do NOT forward DoneEvent here.
-				// Forwarding it causes downstream stages (ws_sink) to think audio is done
-				// while we are still streaming audio.
-				// We will emit our own DoneEvent when audio streaming is actually complete.
+				// Ensure anyone waiting for the stream is unblocked
+				streamOnce.Do(func() {
+					close(streamReady)
+				})
 				return
 			}
 		}
@@ -281,10 +268,23 @@ func (s *TTSStage) Process(ctx context.Context, input <-chan core.Event, output 
 
 		case err := <-errChan:
 			if err != nil {
-				// Log TTS errors but don't send to user - TTS errors are internal
 				logger.Error("TTS error", telemetry.Err(err))
-				s.logError(err)
-				return err
+
+				// Emit user-friendly service message
+				output <- core.ServiceMessageEvent{
+					MessageType: core.ServiceMessageWarning,
+					Content:     "I'm having trouble with my voice right now, but I can still chat via text.",
+					Localized: map[string]string{
+						"en": "I'm having trouble with my voice right now, but I can still chat via text.",
+						"ru": "У меня возникли проблемы с голосом, но я всё ещё могу общаться текстом.",
+					},
+				}
+
+				// Still emit DoneEvent to signal end of participation
+				output <- core.DoneEvent{}
+
+				// Return nil to allow the rest of the pipeline (like LLM text) to continue
+				return nil
 			}
 
 		case event, ok := <-audioChan:
@@ -296,10 +296,21 @@ func (s *TTSStage) Process(ctx context.Context, input <-chan core.Event, output 
 				select {
 				case err := <-errChan:
 					if err != nil {
-						// Log TTS errors but don't send to user
-						logger.Error("TTS error", telemetry.Err(err))
-						s.logError(err)
-						return err
+						logger.Error("TTS error during cleanup", telemetry.Err(err))
+
+						// Emit user-friendly service message
+						output <- core.ServiceMessageEvent{
+							MessageType: core.ServiceMessageWarning,
+							Content:     "I'm having trouble with my voice right now, but I can still chat via text.",
+							Localized: map[string]string{
+								"en": "I'm having trouble with my voice right now, but I can still chat via text.",
+								"ru": "У меня возникли проблемы с голосом, но я всё ещё могу общаться текстом.",
+							},
+						}
+
+						// Still emit DoneEvent to signal end
+						output <- core.DoneEvent{}
+						return nil
 					}
 				default:
 				}

@@ -86,8 +86,8 @@ EndCollection:
 	trimmedText := strings.TrimSpace(fullText)
 	if trimmedText == "" {
 		logger.Info("Received empty or whitespace-only input")
-		// Don't emit anything - STT stage already handled the empty case with a ServiceMessageEvent
-		// Just return without processing
+		// Emit DoneEvent to signal completion
+		output <- core.DoneEvent{}
 		return nil
 	}
 
