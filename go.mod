@@ -4,8 +4,8 @@ go 1.25.5
 
 require (
 	github.com/creastat/infra v0.0.1
-	github.com/creastat/providers v0.0.1
-	github.com/creastat/storage v0.0.1
+	github.com/creastat/providers v0.0.2
+	github.com/creastat/storage v0.0.2
 	github.com/gorilla/websocket v1.5.3
 	github.com/stretchr/testify v1.11.1
 	pgregory.net/rapid v1.1.0
