@@ -127,17 +127,14 @@ func (s *RAGStage) Process(ctx context.Context, input <-chan core.Event, output 
 	// Build context
 	ragContext, err := s.buildContext(ctx, queryText)
 	if err != nil {
-		// Log error but continue with fallback silently (don't send to client)
-		logger.Error("RAG context building failed, using fallback", telemetry.Err(err))
-		ragContext = s.config.FallbackContent
+		// Log error but continue silently (no context)
+		logger.Error("RAG context building failed", telemetry.Err(err))
 	}
 
-	// If no context found, use fallback
-	if ragContext == "" {
-		logger.Info("no context found, using fallback")
-		ragContext = s.config.FallbackContent
-	} else {
+	if ragContext != "" {
 		logger.Info("found context", telemetry.Int("context_length", len(ragContext)))
+	} else {
+		logger.Info("no context found, proceeding without extra context")
 	}
 
 	// Pass the original query with context to the next stage
@@ -165,7 +162,7 @@ func (s *RAGStage) Process(ctx context.Context, input <-chan core.Event, output 
 func (s *RAGStage) buildContext(ctx context.Context, query string) (string, error) {
 	// Skip if no vector store or embedding provider
 	if s.config.VectorStore == nil || s.config.EmbeddingProvider == nil {
-		return s.config.FallbackContent, nil
+		return "", fmt.Errorf("vector store or embedding provider not configured")
 	}
 
 	// Generate embedding for query
